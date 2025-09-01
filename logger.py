@@ -4,9 +4,7 @@
 Triggered Motor Logger GUI (Tkinter + pyX2Cscope) — FIXED f=50, Correct channel mapping & scaling
 ------------------------------------------------------------------------------------------------
 • TRIGGER SOURCE: OmegaElectrical (actual speed), rising edge.
-• Trigger when OmegaElectrical reaches the requested speed (RPM) by default.
-  - Uses per-channel scaling (real = raw × scale). For trigger: raw_trigger = requested_RPM / OmegaElectrical_scale.
-  - You can manually override trigger level (RAW) and trigger delay (% of buffer).
+• Trigger fixed at raw level 700 with 10% delay.
 • Sample-time factor is FIXED to f=50 (short, high-resolution window).
   - Base raw period 50 µs → Ts = 2.5 ms (≈ 400 Hz). Expected total window ≈ 1225 ms.
 
@@ -24,12 +22,12 @@ Channels:
 • “Lock Scales” button freezes scaling before a run.
 
 Export:
-• “Export…” saves a CSV with **scaled** values (real units). No auto-save.
+• “Export…” saves a TSV with **scaled** values (real units). No auto-save.
 
 FIXES in this version:
 • **Correct channel mapping:** data are matched by the **exact variable symbol key** returned by the scope,
   not by dictionary order, eliminating the issue where `idqCmd_q` and `Idq_q` appeared identical.
-• **Correct scaling in export:** CSV writes **scaled** series (real = raw × scale) per channel label.
+• **Correct scaling in export:** TSV writes **scaled** series (real = raw × scale) per channel label.
 """
 
 from __future__ import annotations
@@ -93,6 +91,14 @@ MONITOR_VARS: List[Tuple[str, str]] = [
     ("OmegaElectrical", "motor.omegaElectrical"),
     ("OmegaCmd",        "motor.omegaCmd"),
 ]
+
+DEFAULT_SCALES: Dict[str, float] = {
+    "idqCmd_q": 0.0003125,
+    "Idq_q": 0.0003125,
+    "Idq_d": 0.0003125,
+    "OmegaElectrical": 0.19913,
+    "OmegaCmd": 0.19913,
+}
 
 # Control variables (ELF symbol)
 CTRL_HW_UI      = "app.hardwareUiEnabled"
@@ -175,11 +181,10 @@ class CaptureWorker(threading.Thread):
     """
     • One-shot RUN immediately (sets velocityReference first).
     • Configure scope channels; set sample_time factor = 50 (fixed).
-    • Configure TRIGGER: source = OmegaElectrical, rising edge, level derived from requested speed and scaling
-      by default, but may be manually overridden via the GUI. The trigger delay (%) is GUI-configurable too.
+    • Configure TRIGGER: OmegaElectrical rising edge, fixed raw level 700 with 10% delay.
     • request_scope_data() and wait until is_scope_data_ready() — read the triggered dataset once.
     • Keep motor running until 10 s; then send one-shot STOP (unless early stop requested).
-    • No auto-save — Export button writes CSV later.
+    • No auto-save — Export button writes TSV later.
     """
     def __init__(
         self,
@@ -415,7 +420,6 @@ class MotorLoggerApp(tk.Tk):
 
         self._build_ui()
         self._refresh_ports()
-        self._auto_fill_trigger_from_speed()  # initialize trigger level from defaults
 
     # ---------- UI ----------
 
@@ -455,7 +459,7 @@ class MotorLoggerApp(tk.Tk):
 
         tk.Label(row1, text="Scale (RPM/count):").pack(side="left", padx=(18, 0))
         self.ent_vel_scale = tk.Entry(row1, width=10)
-        self.ent_vel_scale.insert(0, "1.0")
+        self.ent_vel_scale.insert(0, str(DEFAULT_SCALES["OmegaElectrical"]))
         self.ent_vel_scale.pack(side="left", padx=6)
 
         # Row 2: Sampling info + Test button
@@ -502,11 +506,11 @@ class MotorLoggerApp(tk.Tk):
         tk.Label(row4, text="OmegaElectrical scale (RPM/raw):").grid(row=1, column=0, sticky="e", padx=4, pady=3)
         tk.Label(row4, text="OmegaCmd scale (RPM/raw):").grid(row=1, column=2, sticky="e", padx=4, pady=3)
 
-        self.ent_scale_idqcmd = tk.Entry(row4, width=10); self.ent_scale_idqcmd.insert(0, "0.0003125")
-        self.ent_scale_idqq   = tk.Entry(row4, width=10); self.ent_scale_idqq.insert(0, "0.0003125")
-        self.ent_scale_idqd   = tk.Entry(row4, width=10); self.ent_scale_idqd.insert(0, "0.0003125")
-        self.ent_scale_omegae = tk.Entry(row4, width=12); self.ent_scale_omegae.insert(0, "0.19913")  # RPM per raw
-        self.ent_scale_omegac = tk.Entry(row4, width=10); self.ent_scale_omegac.insert(0, "0.19913")
+        self.ent_scale_idqcmd = tk.Entry(row4, width=10); self.ent_scale_idqcmd.insert(0, str(DEFAULT_SCALES["idqCmd_q"]))
+        self.ent_scale_idqq   = tk.Entry(row4, width=10); self.ent_scale_idqq.insert(0, str(DEFAULT_SCALES["Idq_q"]))
+        self.ent_scale_idqd   = tk.Entry(row4, width=10); self.ent_scale_idqd.insert(0, str(DEFAULT_SCALES["Idq_d"]))
+        self.ent_scale_omegae = tk.Entry(row4, width=12); self.ent_scale_omegae.insert(0, str(DEFAULT_SCALES["OmegaElectrical"]))  # RPM per raw
+        self.ent_scale_omegac = tk.Entry(row4, width=10); self.ent_scale_omegac.insert(0, str(DEFAULT_SCALES["OmegaCmd"]))
 
         self.ent_scale_idqcmd.grid(row=0, column=1, padx=6, pady=3, sticky="w")
         self.ent_scale_idqq.grid(row=0, column=3, padx=6, pady=3, sticky="w")
@@ -523,20 +527,15 @@ class MotorLoggerApp(tk.Tk):
 
         tk.Label(row5, text="Trigger level (RAW units):").grid(row=0, column=0, sticky="e", padx=6, pady=3)
         self.ent_trigger_level = tk.Entry(row5, width=14)
-        self.ent_trigger_level.insert(0, "0")  # will be auto-filled from speed on init
+        self.ent_trigger_level.insert(0, "700")
+        self.ent_trigger_level.config(state="disabled")
         self.ent_trigger_level.grid(row=0, column=1, padx=6, pady=3, sticky="w")
 
         tk.Label(row5, text="Trigger delay (% of window):").grid(row=0, column=2, sticky="e", padx=6, pady=3)
         self.ent_trigger_delay = tk.Entry(row5, width=6)
         self.ent_trigger_delay.insert(0, "10")
+        self.ent_trigger_delay.config(state="disabled")
         self.ent_trigger_delay.grid(row=0, column=3, padx=6, pady=3, sticky="w")
-
-        self.btn_set_trigger_from_speed = tk.Button(
-            row5,
-            text="Set level from Speed",
-            command=self._auto_fill_trigger_from_speed
-        )
-        self.btn_set_trigger_from_speed.grid(row=0, column=4, padx=10, pady=3, sticky="w")
 
         # Row 6: Status/output
         row6 = tk.Frame(self)
@@ -545,7 +544,7 @@ class MotorLoggerApp(tk.Tk):
         self.txt_status.pack(fill="both", expand=True)
         self.safe_set_status(
             "Ready. Defaults: f=50 ⇒ Ts=2.5 ms. Currents scale=0.0003125, Speeds scale=0.19913 RPM/raw. "
-            "Trigger defaults to requested RPM (converted to RAW). Lock scales before starting if desired."
+            "Trigger fixed at raw 700 with 10% delay."
         )
 
         # Disable plot buttons if matplotlib missing
@@ -680,11 +679,11 @@ class MotorLoggerApp(tk.Tk):
     def _read_scales(self) -> Dict[str, float]:
         """Get per-channel scaling factors from UI (real = raw × scale)."""
         return {
-            "idqCmd_q":        safe_float(self.ent_scale_idqcmd.get(), 0.0003125),
-            "Idq_q":           safe_float(self.ent_scale_idqq.get(),   0.0003125),
-            "Idq_d":           safe_float(self.ent_scale_idqd.get(),   0.0003125),
-            "OmegaElectrical": safe_float(self.ent_scale_omegae.get(), 0.19913),  # RPM per raw
-            "OmegaCmd":        safe_float(self.ent_scale_omegac.get(), 0.19913),
+            "idqCmd_q":        safe_float(self.ent_scale_idqcmd.get(), DEFAULT_SCALES["idqCmd_q"]),
+            "Idq_q":           safe_float(self.ent_scale_idqq.get(),   DEFAULT_SCALES["Idq_q"]),
+            "Idq_d":           safe_float(self.ent_scale_idqd.get(),   DEFAULT_SCALES["Idq_d"]),
+            "OmegaElectrical": safe_float(self.ent_scale_omegae.get(), DEFAULT_SCALES["OmegaElectrical"]),  # RPM per raw
+            "OmegaCmd":        safe_float(self.ent_scale_omegac.get(), DEFAULT_SCALES["OmegaCmd"]),
         }
 
     def on_toggle_lock_scales(self):
@@ -696,16 +695,6 @@ class MotorLoggerApp(tk.Tk):
             ent.config(state=state)
         self.btn_lock_scales.config(text=("Unlock Scales" if self.scales_locked else "Lock Scales"))
         self.safe_set_status(("Scales locked." if self.scales_locked else "Scales unlocked."))
-
-    def _auto_fill_trigger_from_speed(self):
-        """Compute trigger level in RAW units from requested RPM and OmegaElectrical scale."""
-        speed_rpm = safe_float(self.ent_speed.get(), 0.0)
-        omega_scale = safe_float(self.ent_scale_omegae.get(), 0.19913)
-        omega_scale = max(omega_scale, 1e-12)
-        raw_level = speed_rpm / omega_scale
-        self.ent_trigger_level.delete(0, "end")
-        self.ent_trigger_level.insert(0, f"{raw_level:.3f}")
-        self.safe_set_status(f"Trigger level set from speed: {speed_rpm:.1f} RPM / {omega_scale:.5f} RPM/raw = {raw_level:.3f} RAW.")
 
     def on_start(self):
         if self.worker and self.worker.is_alive():
@@ -779,30 +768,30 @@ class MotorLoggerApp(tk.Tk):
                     self.safe_set_status("STOP sent.")
 
     def on_export(self):
-        """Export the most recent triggered capture (**SCALED**) to a user-selected CSV path."""
+        """Export the most recent triggered capture (**SCALED**) to a user-selected TSV path."""
         if not self.last_scaled or not self.last_t:
             messagebox.showinfo("No data", "Run a capture first.")
             return
         path = filedialog.asksaveasfilename(
-            title="Save CSV (scaled values)",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            title="Save TSV (scaled values)",
+            defaultextension=".tsv",
+            filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")]
         )
         if not path:
             return
         try:
-            self._save_csv(Path(path), self.last_t, self.last_scaled)
+            self._save_tsv(Path(path), self.last_t, self.last_scaled)
             self.safe_set_status(f"Exported: {Path(path).resolve()}")
         except Exception as e:
             self.safe_show_error("Export error", f"{e}\n\n{traceback.format_exc()}")
 
-    def _save_csv(self, csv_path: Path, t_axis: List[float], data_scaled: Dict[str, List[float]]):
-        """Write scaled values to CSV with exact label ordering."""
+    def _save_tsv(self, tsv_path: Path, t_axis: List[float], data_scaled: Dict[str, List[float]]):
+        """Write scaled values to a tab-separated file with exact label ordering."""
         # Align rows to the shortest column length
         n_min = min([len(t_axis)] + [len(data_scaled.get(lbl, [])) for (lbl, _s) in MONITOR_VARS]) if data_scaled else 0
         headers = ["t_s"] + [lbl for (lbl, _s) in MONITOR_VARS]
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+        with tsv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter="\t")
             w.writerow(headers)
             for i in range(n_min):
                 row = [t_axis[i]] + [data_scaled.get(lbl, [None]*n_min)[i] for (lbl, _s) in MONITOR_VARS]
@@ -832,7 +821,7 @@ class MotorLoggerApp(tk.Tk):
 
         self.safe_set_status(
             f"Triggered capture complete. Total≈{total_ms:.2f} ms, Ts={TS_MS:.3f} ms (Fs≈{FS_HZ:.1f} Hz). "
-            f"Use 'Export…' to save CSV (scaled)."
+            f"Use 'Export…' to save TSV (scaled)."
         )
         # Enable plot buttons if matplotlib available & data present
         has_any = t_axis and any(len(v) for v in scaled.values())
