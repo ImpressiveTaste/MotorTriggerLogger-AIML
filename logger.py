@@ -3,9 +3,9 @@
 """
 Triggered Motor Logger GUI (Tkinter + pyX2Cscope) — f=50, Excel export as a real table
 --------------------------------------------------------------------------------------
-• TRIGGER SOURCE: OmegaElectrical (actual speed), rising edge.
-• Trigger when OmegaElectrical reaches the requested speed (RPM) by default.
-  - Uses per-channel scaling (real = raw × scale). For trigger: raw_trigger = requested_RPM / OmegaElectrical_scale.
+• TRIGGER SOURCE: OmegaCmd (commanded speed), rising edge.
+• Trigger when OmegaCmd reaches the requested speed (RPM) by default.
+  - Uses per-channel scaling (real = raw × scale). For trigger: raw_trigger = requested_RPM / OmegaCmd_scale.
   - You can manually override trigger level (RAW) and trigger delay (% of buffer).
 • Sample-time factor is FIXED to f=50 (short, high-resolution window).
   - Base raw period 50 µs → Ts = 2.5 ms (≈ 400 Hz). Expected total window ≈ 1225 ms.
@@ -183,7 +183,7 @@ class CaptureWorker(threading.Thread):
     """
     • One-shot RUN immediately (sets velocityReference first).
     • Configure scope channels; set sample_time factor = 50 (fixed).
-    • Configure TRIGGER: source = OmegaElectrical, rising edge, level derived from requested speed and scaling
+    • Configure TRIGGER: source = OmegaCmd, rising edge, level derived from requested speed and scaling
       by default, but may be manually overridden via the GUI. The trigger delay (%) is GUI-configurable too.
     • request_scope_data() and wait until is_scope_data_ready() — read the triggered dataset once.
     • Keep motor running until 10 s; then STOP once (unless early stop requested).
@@ -248,12 +248,12 @@ class CaptureWorker(threading.Thread):
             except Exception:
                 pass
 
-            # Configure trigger using OmegaElectrical
-            omega_elec_h = self.handles.get("motor.omegaElectrical")
-            if omega_elec_h is None:
-                omega_elec_h = self.handles.get("OmegaElectrical")
-            if omega_elec_h is None:
-                self._ui_status("Warning: OmegaElectrical handle not resolved; proceeding without trigger.")
+            # Configure trigger using OmegaCmd
+            omega_cmd_h = self.handles.get("motor.omegaCmd")
+            if omega_cmd_h is None:
+                omega_cmd_h = self.handles.get("OmegaCmd")
+            if omega_cmd_h is None:
+                self._ui_status("Warning: OmegaCmd handle not resolved; proceeding without trigger.")
                 if hasattr(self.x2c, "reset_scope_trigger"):
                     try:
                         self.x2c.reset_scope_trigger()  # type: ignore
@@ -261,7 +261,7 @@ class CaptureWorker(threading.Thread):
                         pass
             else:
                 cfg = TriggerConfig(
-                    variable=omega_elec_h,
+                    variable=omega_cmd_h,
                     trigger_level=self.trigger_raw_level,
                     trigger_mode=1,                # Triggered
                     trigger_delay=self.trigger_delay_pct,
@@ -271,7 +271,7 @@ class CaptureWorker(threading.Thread):
                     try:
                         self.x2c.set_scope_trigger(cfg)  # type: ignore
                         self._ui_status(
-                            f"Trigger set: OmegaElectrical rising @ raw={self.trigger_raw_level}, "
+                            f"Trigger set: OmegaCmd rising @ raw={self.trigger_raw_level}, "
                             f"delay={self.trigger_delay_pct}%."
                         )
                     except Exception as e:
@@ -398,7 +398,7 @@ class CaptureWorker(threading.Thread):
 class MotorLoggerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Triggered Motor Logger (Tk + pyX2Cscope) — f=50 ⇒ Ts=2.5 ms, Trigger: OmegaElectrical")
+        self.title("Triggered Motor Logger (Tk + pyX2Cscope) — f=50 ⇒ Ts=2.5 ms, Trigger: OmegaCmd")
         self.geometry("1180x810")
 
         # Session state
@@ -471,7 +471,7 @@ class MotorLoggerApp(tk.Tk):
 
         info = (
             f"Triggered scope: f=50, raw=50 µs → Ts = {TS_MS:.3f} ms per sample (Fs ≈ {FS_HZ:.1f} Hz).  "
-            f"Expected total window ≈ {TOTAL_MS_EXPECTED:.0f} ms. Trigger source: OmegaElectrical (rising)."
+            f"Expected total window ≈ {TOTAL_MS_EXPECTED:.0f} ms. Trigger source: OmegaCmd (rising)."
         )
         self.lbl_info = tk.Label(row2, text=info, anchor="w")
         self.lbl_info.pack(side="left", fill="x", expand=True)
@@ -525,7 +525,7 @@ class MotorLoggerApp(tk.Tk):
         self.btn_lock_scales.grid(row=1, column=5, padx=6, pady=3, sticky="e")
 
         # Row 5: Trigger controls (level override + delay)
-        row5 = tk.LabelFrame(self, text="Trigger (OmegaElectrical)")
+        row5 = tk.LabelFrame(self, text="Trigger (OmegaCmd)")
         row5.pack(fill="x", **pad)
 
         tk.Label(row5, text="Trigger level (RAW units):").grid(row=0, column=0, sticky="e", padx=6, pady=3)
@@ -705,9 +705,9 @@ class MotorLoggerApp(tk.Tk):
         self.safe_set_status(("Scales locked." if self.scales_locked else "Scales unlocked."))
 
     def _auto_fill_trigger_from_speed(self):
-        """Compute trigger level in RAW units from requested RPM and OmegaElectrical scale."""
+        """Compute trigger level in RAW units from requested RPM and OmegaCmd scale."""
         speed_rpm = safe_float(self.ent_speed.get(), 0.0)
-        omega_scale = safe_float(self.ent_scale_omegae.get(), 0.19913)
+        omega_scale = safe_float(self.ent_scale_omegac.get(), 0.19913)
         omega_scale = max(omega_scale, 1e-12)
         raw_level = speed_rpm / omega_scale
         self.ent_trigger_level.delete(0, "end")
@@ -763,7 +763,7 @@ class MotorLoggerApp(tk.Tk):
         )
         self.worker.start()
         self.safe_set_status(
-            f"RUN sent one-shot. Trigger: OmegaElectrical rising to raw≈{trigger_level_raw:.1f}, "
+            f"RUN sent one-shot. Trigger: OmegaCmd rising to raw≈{trigger_level_raw:.1f}, "
             f"delay={int(trigger_delay_pct)}%. Capture window ~1.225 s at 2.5 ms/sample…"
         )
         self.safe_set_status(
