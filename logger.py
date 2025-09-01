@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Triggered Motor Logger GUI (Tkinter + pyX2Cscope) — f=50, Excel export as a real table
---------------------------------------------------------------------------------------
-• TRIGGER SOURCE: OmegaCmd (commanded speed), rising edge.
-• Trigger when OmegaCmd reaches the requested speed (RPM) by default.
-  - Uses per-channel scaling (real = raw × scale). For trigger: raw_trigger = requested_RPM / OmegaCmd_scale.
+Triggered Motor Logger GUI (Tkinter + pyX2Cscope) — FIXED f=50, Correct channel mapping & scaling
+------------------------------------------------------------------------------------------------
+• TRIGGER SOURCE: OmegaElectrical (actual speed), rising edge.
+• Trigger when OmegaElectrical reaches the requested speed (RPM) by default.
+  - Uses per-channel scaling (real = raw × scale). For trigger: raw_trigger = requested_RPM / OmegaElectrical_scale.
   - You can manually override trigger level (RAW) and trigger delay (% of buffer).
 • Sample-time factor is FIXED to f=50 (short, high-resolution window).
   - Base raw period 50 µs → Ts = 2.5 ms (≈ 400 Hz). Expected total window ≈ 1225 ms.
@@ -24,16 +24,17 @@ Channels:
 • “Lock Scales” button freezes scaling before a run.
 
 Export:
-• “Export to Excel…” writes an **.xlsx** file using **openpyxl**, creating a proper Excel Table
-  (styled, filterable columns). If openpyxl is not installed, you’ll get a friendly message.
+• “Export…” saves a CSV with **scaled** values (real units). No auto-save.
 
-Fixes:
-• **Exact channel mapping** by ELF symbol key (no index-based mix-ups).
-• **Scaling** applied once, explicitly, when preparing data to plot/export.
+FIXES in this version:
+• **Correct channel mapping:** data are matched by the **exact variable symbol key** returned by the scope,
+  not by dictionary order, eliminating the issue where `idqCmd_q` and `Idq_q` appeared identical.
+• **Correct scaling in export:** CSV writes **scaled** series (real = raw × scale) per channel label.
 """
 
 from __future__ import annotations
 
+import csv
 import sys
 import threading
 import time
@@ -64,15 +65,6 @@ except Exception:  # last-resort fallback if package doesn’t re-export
     import importlib
     _mod = importlib.import_module("pyx2cscope.x2cscope")
     X2CScope = getattr(_mod, "X2CScope")
-
-# Optional Excel writer (strongly recommended)
-try:
-    import openpyxl  # type: ignore
-    from openpyxl import Workbook  # type: ignore
-    from openpyxl.worksheet.table import Table, TableStyleInfo  # type: ignore
-    HAS_OPENPYXL = True
-except Exception:
-    HAS_OPENPYXL = False
 
 
 # ----------------------------- Fixed sampling + timings -----------------------------
@@ -183,11 +175,11 @@ class CaptureWorker(threading.Thread):
     """
     • One-shot RUN immediately (sets velocityReference first).
     • Configure scope channels; set sample_time factor = 50 (fixed).
-    • Configure TRIGGER: source = OmegaCmd, rising edge, level derived from requested speed and scaling
+    • Configure TRIGGER: source = OmegaElectrical, rising edge, level derived from requested speed and scaling
       by default, but may be manually overridden via the GUI. The trigger delay (%) is GUI-configurable too.
     • request_scope_data() and wait until is_scope_data_ready() — read the triggered dataset once.
-    • Keep motor running until 10 s; then STOP once (unless early stop requested).
-    • No auto-save — Export button writes Excel later.
+    • Keep motor running until 10 s; then send one-shot STOP (unless early stop requested).
+    • No auto-save — Export button writes CSV later.
     """
     def __init__(
         self,
@@ -248,12 +240,13 @@ class CaptureWorker(threading.Thread):
             except Exception:
                 pass
 
-            # Configure trigger using OmegaCmd
-            omega_cmd_h = self.handles.get("motor.omegaCmd")
-            if omega_cmd_h is None:
-                omega_cmd_h = self.handles.get("OmegaCmd")
-            if omega_cmd_h is None:
-                self._ui_status("Warning: OmegaCmd handle not resolved; proceeding without trigger.")
+            # Configure trigger using OmegaElectrical
+            omega_elec_h = self.handles.get("motor.omegaElectrical")
+            if omega_elec_h is None:
+                # Some builds may have different keying, but we always added by this symbol
+                omega_elec_h = self.handles.get("OmegaElectrical")
+            if omega_elec_h is None:
+                self._ui_status("Warning: OmegaElectrical handle not resolved; proceeding without trigger.")
                 if hasattr(self.x2c, "reset_scope_trigger"):
                     try:
                         self.x2c.reset_scope_trigger()  # type: ignore
@@ -261,7 +254,7 @@ class CaptureWorker(threading.Thread):
                         pass
             else:
                 cfg = TriggerConfig(
-                    variable=omega_cmd_h,
+                    variable=omega_elec_h,
                     trigger_level=self.trigger_raw_level,
                     trigger_mode=1,                # Triggered
                     trigger_delay=self.trigger_delay_pct,
@@ -271,7 +264,7 @@ class CaptureWorker(threading.Thread):
                     try:
                         self.x2c.set_scope_trigger(cfg)  # type: ignore
                         self._ui_status(
-                            f"Trigger set: OmegaCmd rising @ raw={self.trigger_raw_level}, "
+                            f"Trigger set: OmegaElectrical rising @ raw={self.trigger_raw_level}, "
                             f"delay={self.trigger_delay_pct}%."
                         )
                     except Exception as e:
@@ -367,15 +360,15 @@ class CaptureWorker(threading.Thread):
                 self.total_ms_reported = TOTAL_MS_EXPECTED
 
             # Keep motor running until 10 s total, then STOP once
-            t_run_start2 = time.time()
             while not self._stop_flag.is_set() and (time.time() - t_run_start) < RUN_SECONDS:
                 time.sleep(SLEEP_POLL)
+
             if not self._stop_sent:
                 stop_h = self.handles.get(CTRL_STOP_REQ)
                 if stop_h is not None:
                     try_write(self.x2c, stop_h, 1)
                 self._stop_sent = True
-                self._ui_status(f"STOP sent (one-shot). Runtime {(time.time()-t_run_start2):.2f}s.")
+                self._ui_status("STOP sent (one-shot).")
 
             # Notify GUI with RAW data; GUI will scale for plots/export
             self.app.on_capture_complete(self.data_raw, self.t_axis, self.total_ms_reported, self.scales)
@@ -398,8 +391,8 @@ class CaptureWorker(threading.Thread):
 class MotorLoggerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Triggered Motor Logger (Tk + pyX2Cscope) — f=50 ⇒ Ts=2.5 ms, Trigger: OmegaCmd")
-        self.geometry("1180x810")
+        self.title("Triggered Motor Logger (Tk + pyX2Cscope) — f=50 ⇒ Ts=2.5 ms, Trigger: OmegaElectrical")
+        self.geometry("1180x780")
 
         # Session state
         self.x2c: Optional[X2CScope] = None
@@ -471,7 +464,7 @@ class MotorLoggerApp(tk.Tk):
 
         info = (
             f"Triggered scope: f=50, raw=50 µs → Ts = {TS_MS:.3f} ms per sample (Fs ≈ {FS_HZ:.1f} Hz).  "
-            f"Expected total window ≈ {TOTAL_MS_EXPECTED:.0f} ms. Trigger source: OmegaCmd (rising)."
+            f"Expected total window ≈ {TOTAL_MS_EXPECTED:.0f} ms. Trigger source: OmegaElectrical (rising)."
         )
         self.lbl_info = tk.Label(row2, text=info, anchor="w")
         self.lbl_info.pack(side="left", fill="x", expand=True)
@@ -492,7 +485,7 @@ class MotorLoggerApp(tk.Tk):
         self.btn_stop = tk.Button(row3, text="STOP ■", width=10, command=self.on_stop)
         self.btn_stop.pack(side="left", padx=6)
 
-        self.btn_export = tk.Button(row3, text="Export to Excel…", width=18, command=self.on_export_excel)
+        self.btn_export = tk.Button(row3, text="Export…", width=12, command=self.on_export)
         self.btn_export.pack(side="left", padx=(18, 6))
 
         self.btn_plot_curr = tk.Button(row3, text="Plot Currents", width=14, command=lambda: self.show_plot("currents"))
@@ -525,7 +518,7 @@ class MotorLoggerApp(tk.Tk):
         self.btn_lock_scales.grid(row=1, column=5, padx=6, pady=3, sticky="e")
 
         # Row 5: Trigger controls (level override + delay)
-        row5 = tk.LabelFrame(self, text="Trigger (OmegaCmd)")
+        row5 = tk.LabelFrame(self, text="Trigger (OmegaElectrical)")
         row5.pack(fill="x", **pad)
 
         tk.Label(row5, text="Trigger level (RAW units):").grid(row=0, column=0, sticky="e", padx=6, pady=3)
@@ -548,7 +541,7 @@ class MotorLoggerApp(tk.Tk):
         # Row 6: Status/output
         row6 = tk.Frame(self)
         row6.pack(fill="both", expand=True, **pad)
-        self.txt_status = tk.Text(row6, height=18)
+        self.txt_status = tk.Text(row6, height=16)
         self.txt_status.pack(fill="both", expand=True)
         self.safe_set_status(
             "Ready. Defaults: f=50 ⇒ Ts=2.5 ms. Currents scale=0.0003125, Speeds scale=0.19913 RPM/raw. "
@@ -705,9 +698,9 @@ class MotorLoggerApp(tk.Tk):
         self.safe_set_status(("Scales locked." if self.scales_locked else "Scales unlocked."))
 
     def _auto_fill_trigger_from_speed(self):
-        """Compute trigger level in RAW units from requested RPM and OmegaCmd scale."""
+        """Compute trigger level in RAW units from requested RPM and OmegaElectrical scale."""
         speed_rpm = safe_float(self.ent_speed.get(), 0.0)
-        omega_scale = safe_float(self.ent_scale_omegac.get(), 0.19913)
+        omega_scale = safe_float(self.ent_scale_omegae.get(), 0.19913)
         omega_scale = max(omega_scale, 1e-12)
         raw_level = speed_rpm / omega_scale
         self.ent_trigger_level.delete(0, "end")
@@ -725,7 +718,7 @@ class MotorLoggerApp(tk.Tk):
             if not self.connected:
                 return
 
-        # Parameters: convert RPM to counts via Scale; trigger level from controls
+        # Parameters: convert RPM to counts via Scale; trigger level computed from controls
         speed_rpm = safe_float(self.ent_speed.get(), 0.0)
         vel_scale_rpm_per_count = safe_float(self.ent_vel_scale.get(), 0.0)
         if vel_scale_rpm_per_count == 0.0:
@@ -733,6 +726,7 @@ class MotorLoggerApp(tk.Tk):
             return
 
         counts = speed_rpm / vel_scale_rpm_per_count
+
         scales = self._read_scales()  # either locked or not, we just read current values
 
         # Trigger settings
@@ -763,9 +757,10 @@ class MotorLoggerApp(tk.Tk):
         )
         self.worker.start()
         self.safe_set_status(
-            f"RUN sent one-shot. Trigger: OmegaCmd rising to raw≈{trigger_level_raw:.1f}, "
+            f"RUN will be sent once. Trigger: OmegaElectrical rising to raw≈{trigger_level_raw:.1f}, "
             f"delay={int(trigger_delay_pct)}%. Capture window ~1.225 s at 2.5 ms/sample…"
         )
+        # Log current scale set for traceability
         self.safe_set_status(
             "Scales used: " + ", ".join([f"{k}={v}" for k, v in scales.items()])
         )
@@ -783,81 +778,35 @@ class MotorLoggerApp(tk.Tk):
                     try_write(self.x2c, h, 1)
                     self.safe_set_status("STOP sent.")
 
-    # ---------- Export (Excel Table) ----------
-
-    def on_export_excel(self):
-        """Export the most recent triggered capture to Excel (.xlsx) with a real Excel Table."""
+    def on_export(self):
+        """Export the most recent triggered capture (**SCALED**) to a user-selected CSV path."""
         if not self.last_scaled or not self.last_t:
             messagebox.showinfo("No data", "Run a capture first.")
             return
-        if not HAS_OPENPYXL:
-            messagebox.showerror(
-                "openpyxl not installed",
-                "This export needs 'openpyxl'. Install it (e.g. pip install openpyxl) and try again."
-            )
-            return
         path = filedialog.asksaveasfilename(
-            title="Save Excel",
-            defaultextension=".xlsx",
-            filetypes=[("Excel Workbook", "*.xlsx")]
+            title="Save CSV (scaled values)",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
         )
         if not path:
             return
         try:
-            self._save_excel_table(Path(path), self.last_t, self.last_scaled)
-            self.safe_set_status(f"Exported Excel table: {Path(path).resolve()}")
+            self._save_csv(Path(path), self.last_t, self.last_scaled)
+            self.safe_set_status(f"Exported: {Path(path).resolve()}")
         except Exception as e:
             self.safe_show_error("Export error", f"{e}\n\n{traceback.format_exc()}")
 
-    def _save_excel_table(self, xlsx_path: Path, t_axis: List[float], data_scaled: Dict[str, List[float]]):
-        """Create an XLSX with a proper Excel Table (filters, style) via openpyxl."""
-        # Align to shortest column
+    def _save_csv(self, csv_path: Path, t_axis: List[float], data_scaled: Dict[str, List[float]]):
+        """Write scaled values to CSV with exact label ordering."""
+        # Align rows to the shortest column length
         n_min = min([len(t_axis)] + [len(data_scaled.get(lbl, [])) for (lbl, _s) in MONITOR_VARS]) if data_scaled else 0
         headers = ["t_s"] + [lbl for (lbl, _s) in MONITOR_VARS]
-
-        wb: Workbook = Workbook()
-        ws = wb.active
-        ws.title = "ScopeData"
-
-        # Write header
-        ws.append(headers)
-
-        # Write rows
-        for i in range(n_min):
-            row = [t_axis[i]] + [data_scaled.get(lbl, [None]*n_min)[i] for (lbl, _s) in MONITOR_VARS]
-            ws.append(row)
-
-        # Create Excel Table
-        last_col_letter = openpyxl.utils.get_column_letter(len(headers))
-        table_ref = f"A1:{last_col_letter}{n_min + 1}"
-        table = Table(displayName="ScopeTable", ref=table_ref)
-
-        style = TableStyleInfo(
-            name="TableStyleMedium9",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        table.tableStyleInfo = style
-        ws.add_table(table)
-
-        # Set reasonable column widths
-        ws.column_dimensions["A"].width = 12  # t_s
-        for idx in range(2, len(headers) + 1):
-            ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = 18
-
-        # A little metadata sheet
-        meta = wb.create_sheet("Info")
-        meta.append(["Sampling factor f", FACTOR_F])
-        meta.append(["Raw sample time (µs)", RAW_SAMPLE_TIME_US])
-        meta.append(["Effective Ts (ms)", TS_MS])
-        meta.append(["Effective Fs (Hz)", FS_HZ])
-        meta.append(["Captured rows", n_min])
-
-        wb.save(str(xlsx_path))
-
-    # ---------- Finish capture ----------
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for i in range(n_min):
+                row = [t_axis[i]] + [data_scaled.get(lbl, [None]*n_min)[i] for (lbl, _s) in MONITOR_VARS]
+                w.writerow(row)
 
     def on_capture_complete(
         self,
@@ -883,7 +832,7 @@ class MotorLoggerApp(tk.Tk):
 
         self.safe_set_status(
             f"Triggered capture complete. Total≈{total_ms:.2f} ms, Ts={TS_MS:.3f} ms (Fs≈{FS_HZ:.1f} Hz). "
-            f"Use 'Export to Excel…' to save an .xlsx with an Excel Table."
+            f"Use 'Export…' to save CSV (scaled)."
         )
         # Enable plot buttons if matplotlib available & data present
         has_any = t_axis and any(len(v) for v in scaled.values())
